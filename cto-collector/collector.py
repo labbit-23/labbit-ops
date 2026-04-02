@@ -348,6 +348,10 @@ def collect_host_metrics(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         pass
 
     load_1 = safe_read_float("/proc/loadavg")
+    cpu_cores = os.cpu_count() or 1
+    load_1_per_core_pct = None
+    if isinstance(load_1, float) and cpu_cores > 0:
+        load_1_per_core_pct = min(999.0, max(0.0, (load_1 / float(cpu_cores)) * 100.0))
 
     severity = "healthy"
     reasons: List[str] = []
@@ -385,6 +389,8 @@ def collect_host_metrics(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         "disk_total_gb": round(disk_total / (1024 ** 3), 2) if isinstance(disk_total, int) else None,
         "disk_used_gb": round(disk_used / (1024 ** 3), 2) if isinstance(disk_used, int) else None,
         "load_1": round(load_1, 2) if isinstance(load_1, float) else None,
+        "cpu_cores": int(cpu_cores),
+        "load_1_per_core_pct": round(load_1_per_core_pct, 2) if isinstance(load_1_per_core_pct, float) else None,
     }
 
     services.append(
