@@ -34,6 +34,14 @@ CTO_PM2_RESTART_STORM_DELTA=3
 CTO_EVENT_COOLDOWN_SECONDS=600
 ```
 
+
+## Standard deploy (from labbit-ops repo)
+
+```bash
+cd /opt/labbit-ops
+bash scripts/deploy-vps-ops.sh
+```
+
 ## Run once (manual)
 
 ```bash
