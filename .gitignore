@@ -1,0 +1,22 @@
+# Local environment and secrets
+cto-collector/.env
+*.env
+*.env.local
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log
