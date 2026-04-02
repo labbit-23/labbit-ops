@@ -10,7 +10,7 @@ It is designed to be lightweight and safe on production VPS.
 
 ## Files
 
-- `collector.py`: main collector loop (PM2 + Docker signals)
+- `collector.py`: main collector loop (PM2 + VPS host + Docker signals)
 - `run_digest.sh`: daily digest trigger for `/api/cto/compact`
 
 ## Required env vars
@@ -32,6 +32,11 @@ CTO_DOCKER_BIN=docker
 CTO_ENABLE_DOCKER=1
 CTO_PM2_RESTART_STORM_DELTA=3
 CTO_EVENT_COOLDOWN_SECONDS=600
+CTO_HOST_MEM_WARN_PCT=80
+CTO_HOST_MEM_CRITICAL_PCT=92
+CTO_HOST_DISK_WARN_PCT=85
+CTO_HOST_DISK_CRITICAL_PCT=95
+CTO_HOST_SWAP_WARN_PCT=35
 ```
 
 
@@ -78,4 +83,3 @@ pm2 save
 Run SQL file:
 
 - `../labbit-ops/sql/cto-digest-backfill.sql`
-

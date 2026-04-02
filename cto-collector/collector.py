@@ -22,6 +22,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 
+RESTART_WINDOW_SECONDS = 24 * 60 * 60
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -76,13 +79,24 @@ def post_json(url: str, token: str, payload: Dict[str, Any], timeout: int = 8) -
         return False, str(exc)
 
 
+def initial_state() -> Dict[str, Any]:
+    return {
+        "pm2_restarts": {},
+        "pm2_restart_samples": {},
+        "event_last_sent_at": {},
+    }
+
+
 def load_state(path: Path) -> Dict[str, Any]:
     if not path.exists():
-        return {"pm2_restarts": {}, "event_last_sent_at": {}}
+        return initial_state()
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        base = initial_state()
+        base.update(loaded if isinstance(loaded, dict) else {})
+        return base
     except Exception:
-        return {"pm2_restarts": {}, "event_last_sent_at": {}}
+        return initial_state()
 
 
 def save_state(path: Path, state: Dict[str, Any]) -> None:
@@ -90,7 +104,58 @@ def save_state(path: Path, state: Dict[str, Any]) -> None:
     path.write_text(json.dumps(state, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
-def collect_pm2(pm2_bin: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
+def compute_restarts_24h(
+    state: Dict[str, Any],
+    restart_map: Dict[str, int],
+    now_ts: int,
+) -> Dict[str, int]:
+    history = state.setdefault("pm2_restart_samples", {})
+    cutoff = now_ts - RESTART_WINDOW_SECONDS
+    restarts_24h: Dict[str, int] = {}
+
+    for service_key, current in restart_map.items():
+        samples = history.get(service_key, [])
+        if not isinstance(samples, list):
+            samples = []
+
+        samples.append({"ts": int(now_ts), "value": int(current)})
+        samples = [
+            s
+            for s in samples
+            if isinstance(s, dict)
+            and int(s.get("ts", 0)) >= cutoff
+            and isinstance(s.get("value", 0), int)
+        ]
+        samples.sort(key=lambda item: int(item.get("ts", 0)))
+
+        if samples:
+            baseline = int(samples[0].get("value", current))
+            delta = max(0, int(current) - baseline)
+        else:
+            delta = 0
+
+        restarts_24h[service_key] = delta
+        history[service_key] = samples[-2000:]
+
+    for service_key in list(history.keys()):
+        if service_key in restart_map:
+            continue
+        samples = history.get(service_key, [])
+        if not isinstance(samples, list):
+            del history[service_key]
+            continue
+        kept = [
+            s for s in samples if isinstance(s, dict) and int(s.get("ts", 0)) >= cutoff
+        ]
+        if kept:
+            history[service_key] = kept[-2000:]
+        else:
+            del history[service_key]
+
+    return restarts_24h
+
+
+def collect_pm2(pm2_bin: str, state: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
     services: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
     restart_map: Dict[str, int] = {}
@@ -125,6 +190,7 @@ def collect_pm2(pm2_bin: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]
     except Exception:
         rows = []
 
+    row_infos: List[Dict[str, Any]] = []
     for row in rows:
         name = str(row.get("name") or "pm2_proc")
         key = f"{normalize_key(name)}__vps"
@@ -133,19 +199,40 @@ def collect_pm2(pm2_bin: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]
         status = str(pm2_env.get("status") or "").lower()
         restarts = int(pm2_env.get("restart_time") or 0)
         restart_map[key] = restarts
+        row_infos.append(
+            {
+                "name": name,
+                "key": key,
+                "status": status,
+                "restarts": restarts,
+                "cpu": monit.get("cpu"),
+                "memory": monit.get("memory"),
+            }
+        )
+
+    restarts_24h_map = compute_restarts_24h(state, restart_map, int(time.time()))
+
+    for info in row_infos:
+        name = info["name"]
+        key = info["key"]
+        status = info["status"]
+        restarts = int(info["restarts"])
+        cpu = info["cpu"]
+        mem = info["memory"]
+        restarts_24h = int(restarts_24h_map.get(key, 0))
 
         if status == "online":
             norm_status = "healthy"
-            if restarts >= 20:
+            if restarts_24h >= 3:
+                norm_status = "down"
+            elif restarts_24h >= 1:
                 norm_status = "degraded"
         elif status in {"launching", "stopping", "errored"}:
             norm_status = "down"
         else:
             norm_status = "unknown"
 
-        cpu = monit.get("cpu")
-        mem = monit.get("memory")
-        msg = f"pm2={status or 'unknown'} restarts={restarts}"
+        msg = f"pm2={status or 'unknown'} restarts_24h={restarts_24h} restarts_total={restarts}"
         if cpu is not None:
             msg += f" cpu={cpu}"
         if mem is not None:
@@ -162,6 +249,7 @@ def collect_pm2(pm2_bin: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]
                 "payload": {
                     "pm2_status": status,
                     "restarts": restarts,
+                    "restarts_24h": restarts_24h,
                     "cpu": cpu,
                     "memory": mem,
                 },
@@ -172,15 +260,158 @@ def collect_pm2(pm2_bin: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]
             events.append(
                 {
                     "service_key": key,
-                    "event_type": "pm2_process_down",
-                    "severity": "high",
-                    "message": f"{name} is {status or 'down'}",
-                    "payload": {"pm2_status": status, "restarts": restarts},
+                    "event_type": "pm2_process_down" if status != "online" else "pm2_restart_storm_24h",
+                    "severity": "high" if status != "online" else "critical",
+                    "message": (
+                        f"{name} is {status or 'down'}"
+                        if status != "online"
+                        else f"{name} restart volume high in 24h: {restarts_24h}"
+                    ),
+                    "payload": {
+                        "pm2_status": status,
+                        "restarts": restarts,
+                        "restarts_24h": restarts_24h,
+                    },
                     "event_at": now_iso(),
                 }
             )
 
     return services, events, restart_map
+
+
+def read_meminfo() -> Dict[str, int]:
+    data: Dict[str, int] = {}
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.split(":", 1)
+                if len(parts) != 2:
+                    continue
+                key = parts[0].strip()
+                values = parts[1].strip().split()
+                if not values:
+                    continue
+                data[key] = int(values[0])
+    except Exception:
+        return {}
+    return data
+
+
+def safe_read_float(path: str) -> float | None:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            parts = handle.read().strip().split()
+            if not parts:
+                return None
+            value = float(parts[0])
+            if value < 0:
+                return None
+            return value
+    except Exception:
+        return None
+
+
+def collect_host_metrics(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    services: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
+
+    meminfo = read_meminfo()
+    mem_total_kb = meminfo.get("MemTotal")
+    mem_available_kb = meminfo.get("MemAvailable")
+    mem_used_kb = None
+    mem_pct = None
+    if isinstance(mem_total_kb, int) and mem_total_kb > 0 and isinstance(mem_available_kb, int):
+        mem_used_kb = max(0, mem_total_kb - mem_available_kb)
+        mem_pct = (mem_used_kb / mem_total_kb) * 100.0
+
+    swap_total_kb = meminfo.get("SwapTotal")
+    swap_free_kb = meminfo.get("SwapFree")
+    swap_used_kb = None
+    swap_pct = None
+    if isinstance(swap_total_kb, int) and swap_total_kb > 0 and isinstance(swap_free_kb, int):
+        swap_used_kb = max(0, swap_total_kb - swap_free_kb)
+        swap_pct = (swap_used_kb / swap_total_kb) * 100.0
+
+    disk_total = None
+    disk_used = None
+    disk_pct = None
+    try:
+        vfs = os.statvfs("/")
+        total = int(vfs.f_blocks) * int(vfs.f_frsize)
+        free = int(vfs.f_bavail) * int(vfs.f_frsize)
+        used = max(0, total - free)
+        disk_total = total
+        disk_used = used
+        if total > 0:
+            disk_pct = (used / total) * 100.0
+    except Exception:
+        pass
+
+    load_1 = safe_read_float("/proc/loadavg")
+
+    severity = "healthy"
+    reasons: List[str] = []
+    if isinstance(mem_pct, float) and mem_pct >= config["host_mem_critical_pct"]:
+        severity = "down"
+        reasons.append(f"memory high {mem_pct:.1f}%")
+    elif isinstance(mem_pct, float) and mem_pct >= config["host_mem_warn_pct"]:
+        severity = "degraded"
+        reasons.append(f"memory elevated {mem_pct:.1f}%")
+
+    if isinstance(disk_pct, float) and disk_pct >= config["host_disk_critical_pct"]:
+        severity = "down"
+        reasons.append(f"disk high {disk_pct:.1f}%")
+    elif isinstance(disk_pct, float) and disk_pct >= config["host_disk_warn_pct"] and severity != "down":
+        severity = "degraded"
+        reasons.append(f"disk elevated {disk_pct:.1f}%")
+
+    if isinstance(swap_pct, float) and swap_pct >= config["host_swap_warn_pct"] and severity != "down":
+        severity = "degraded"
+        reasons.append(f"swap high {swap_pct:.1f}%")
+
+    if not reasons:
+        reasons.append("host pressure nominal")
+
+    message = " | ".join(reasons)
+
+    payload = {
+        "memory_pct": round(mem_pct, 2) if isinstance(mem_pct, float) else None,
+        "memory_total_mb": round(mem_total_kb / 1024, 2) if isinstance(mem_total_kb, int) else None,
+        "memory_used_mb": round(mem_used_kb / 1024, 2) if isinstance(mem_used_kb, int) else None,
+        "swap_pct": round(swap_pct, 2) if isinstance(swap_pct, float) else None,
+        "swap_total_mb": round(swap_total_kb / 1024, 2) if isinstance(swap_total_kb, int) else None,
+        "swap_used_mb": round(swap_used_kb / 1024, 2) if isinstance(swap_used_kb, int) else None,
+        "disk_pct": round(disk_pct, 2) if isinstance(disk_pct, float) else None,
+        "disk_total_gb": round(disk_total / (1024 ** 3), 2) if isinstance(disk_total, int) else None,
+        "disk_used_gb": round(disk_used / (1024 ** 3), 2) if isinstance(disk_used, int) else None,
+        "load_1": round(load_1, 2) if isinstance(load_1, float) else None,
+    }
+
+    services.append(
+        {
+            "service_key": "vps_host__vps",
+            "category": "ops",
+            "label": "VPS Host",
+            "status": severity,
+            "latency_ms": None,
+            "message": message[:240],
+            "payload": payload,
+        }
+    )
+
+    if severity in {"degraded", "down"}:
+        events.append(
+            {
+                "service_key": "vps_host__vps",
+                "event_type": "vps_host_pressure",
+                "severity": "high" if severity == "down" else "medium",
+                "message": message[:240],
+                "payload": payload,
+                "event_at": now_iso(),
+            }
+        )
+
+    return services, events
 
 
 def collect_docker(docker_bin: str, enabled: bool) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -291,9 +522,13 @@ def run_cycle(config: Dict[str, Any], state: Dict[str, Any]) -> int:
     services: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
 
-    pm2_services, pm2_events, restart_map = collect_pm2(config["pm2_bin"])
+    pm2_services, pm2_events, restart_map = collect_pm2(config["pm2_bin"], state)
     services.extend(pm2_services)
     events.extend(pm2_events)
+
+    host_services, host_events = collect_host_metrics(config)
+    services.extend(host_services)
+    events.extend(host_events)
 
     docker_services, docker_events = collect_docker(config["docker_bin"], config["enable_docker"])
     services.extend(docker_services)
@@ -366,6 +601,11 @@ def load_config() -> Dict[str, Any]:
         "enable_docker": getenv_bool("CTO_ENABLE_DOCKER", True),
         "restart_storm_delta": int(os.getenv("CTO_PM2_RESTART_STORM_DELTA", "3")),
         "event_cooldown_seconds": int(os.getenv("CTO_EVENT_COOLDOWN_SECONDS", "600")),
+        "host_mem_warn_pct": float(os.getenv("CTO_HOST_MEM_WARN_PCT", "80")),
+        "host_mem_critical_pct": float(os.getenv("CTO_HOST_MEM_CRITICAL_PCT", "92")),
+        "host_disk_warn_pct": float(os.getenv("CTO_HOST_DISK_WARN_PCT", "85")),
+        "host_disk_critical_pct": float(os.getenv("CTO_HOST_DISK_CRITICAL_PCT", "95")),
+        "host_swap_warn_pct": float(os.getenv("CTO_HOST_SWAP_WARN_PCT", "35")),
     }
 
 
@@ -398,4 +638,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
