@@ -167,7 +167,9 @@ def compute_restarts_24h(
     return restarts_24h
 
 
-def collect_pm2(pm2_bin: str, state: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
+def collect_pm2(
+    pm2_bin: str, state: Dict[str, Any], config: Dict[str, Any]
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
     services: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
     restart_map: Dict[str, int] = {}
@@ -572,7 +574,7 @@ def run_cycle(config: Dict[str, Any], state: Dict[str, Any]) -> int:
     services: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
 
-    pm2_services, pm2_events, restart_map = collect_pm2(config["pm2_bin"], state)
+    pm2_services, pm2_events, restart_map = collect_pm2(config["pm2_bin"], state, config)
     services.extend(pm2_services)
     events.extend(pm2_events)
 
