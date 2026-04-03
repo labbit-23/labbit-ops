@@ -51,6 +51,18 @@ def run_cmd(args: List[str], timeout: int = 6) -> Tuple[int, str, str]:
         return 1, "", str(exc)
 
 
+def parse_csv_lower(value: str) -> List[str]:
+    return [item.strip().lower() for item in str(value or "").split(",") if item.strip()]
+
+
+def file_age_seconds(path: str) -> int | None:
+    try:
+        stat = os.stat(path)
+        return max(0, int(time.time() - int(stat.st_mtime)))
+    except Exception:
+        return None
+
+
 def normalize_key(raw: str) -> str:
     key = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
     return key or "unknown"
@@ -207,6 +219,8 @@ def collect_pm2(pm2_bin: str, state: Dict[str, Any]) -> Tuple[List[Dict[str, Any
                 "restarts": restarts,
                 "cpu": monit.get("cpu"),
                 "memory": monit.get("memory"),
+                "out_log_path": str(pm2_env.get("pm_out_log_path") or ""),
+                "cron_restart": str(pm2_env.get("cron_restart") or ""),
             }
         )
 
@@ -219,9 +233,30 @@ def collect_pm2(pm2_bin: str, state: Dict[str, Any]) -> Tuple[List[Dict[str, Any
         restarts = int(info["restarts"])
         cpu = info["cpu"]
         mem = info["memory"]
+        out_log_path = info.get("out_log_path") or ""
+        cron_restart = info.get("cron_restart") or ""
         restarts_24h = int(restarts_24h_map.get(key, 0))
+        scheduled_names = config.get("scheduled_pm2_names", [])
+        is_scheduled_job = str(name or "").strip().lower() in scheduled_names
 
-        if status == "online":
+        if is_scheduled_job:
+            log_age = file_age_seconds(out_log_path) if out_log_path else None
+            max_ok = int(config.get("scheduled_job_max_age_seconds", 36 * 60 * 60))
+            warn_age = int(config.get("scheduled_job_warn_age_seconds", 30 * 60 * 60))
+            if status == "online":
+                norm_status = "healthy"
+            elif status == "stopped":
+                if log_age is None:
+                    norm_status = "degraded"
+                elif log_age > max_ok:
+                    norm_status = "down"
+                elif log_age > warn_age:
+                    norm_status = "degraded"
+                else:
+                    norm_status = "healthy"
+            else:
+                norm_status = "down"
+        elif status == "online":
             norm_status = "healthy"
             if restarts_24h >= 3:
                 norm_status = "down"
@@ -233,6 +268,12 @@ def collect_pm2(pm2_bin: str, state: Dict[str, Any]) -> Tuple[List[Dict[str, Any
             norm_status = "unknown"
 
         msg = f"pm2={status or 'unknown'} restarts_24h={restarts_24h} restarts_total={restarts}"
+        if is_scheduled_job:
+            log_age = file_age_seconds(out_log_path) if out_log_path else None
+            if log_age is None:
+                msg += " scheduled_job_log_age=unknown"
+            else:
+                msg += f" scheduled_job_log_age_min={log_age // 60}"
         if cpu is not None:
             msg += f" cpu={cpu}"
         if mem is not None:
@@ -252,6 +293,9 @@ def collect_pm2(pm2_bin: str, state: Dict[str, Any]) -> Tuple[List[Dict[str, Any
                     "restarts_24h": restarts_24h,
                     "cpu": cpu,
                     "memory": mem,
+                    "scheduled_job": is_scheduled_job,
+                    "pm2_cron_restart": cron_restart or None,
+                    "out_log_path": out_log_path or None,
                 },
             }
         )
@@ -612,6 +656,9 @@ def load_config() -> Dict[str, Any]:
         "host_disk_warn_pct": float(os.getenv("CTO_HOST_DISK_WARN_PCT", "85")),
         "host_disk_critical_pct": float(os.getenv("CTO_HOST_DISK_CRITICAL_PCT", "95")),
         "host_swap_warn_pct": float(os.getenv("CTO_HOST_SWAP_WARN_PCT", "35")),
+        "scheduled_pm2_names": parse_csv_lower(os.getenv("CTO_SCHEDULED_PM2_NAMES", "labbit-cto-digest")),
+        "scheduled_job_warn_age_seconds": int(os.getenv("CTO_SCHEDULED_JOB_WARN_AGE_SECONDS", str(30 * 60 * 60))),
+        "scheduled_job_max_age_seconds": int(os.getenv("CTO_SCHEDULED_JOB_MAX_AGE_SECONDS", str(36 * 60 * 60))),
     }
 
 

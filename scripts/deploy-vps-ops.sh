@@ -10,7 +10,9 @@ set -euo pipefail
 #   COLLECTOR_ENV_FILE=/opt/labbit-ops/cto-collector/.env
 #   PM2_COLLECTOR_NAME=labbit-cto-collector
 #   PM2_DIGEST_NAME=labbit-cto-digest
+#   PM2_CLEANUP_NAME=labbit-ops-cleanup
 #   DIGEST_CRON="20 1 * * *"
+#   CLEANUP_CRON="35 1 * * *"
 #   START_PM2=1
 
 OPS_DIR="${OPS_DIR:-/opt/labbit-ops}"
@@ -18,7 +20,9 @@ BRANCH="${BRANCH:-main}"
 COLLECTOR_ENV_FILE="${COLLECTOR_ENV_FILE:-${OPS_DIR}/cto-collector/.env}"
 PM2_COLLECTOR_NAME="${PM2_COLLECTOR_NAME:-labbit-cto-collector}"
 PM2_DIGEST_NAME="${PM2_DIGEST_NAME:-labbit-cto-digest}"
+PM2_CLEANUP_NAME="${PM2_CLEANUP_NAME:-labbit-ops-cleanup}"
 DIGEST_CRON="${DIGEST_CRON:-20 1 * * *}"
+CLEANUP_CRON="${CLEANUP_CRON:-35 1 * * *}"
 START_PM2="${START_PM2:-1}"
 
 echo "==> Deploying labbit-ops from ${OPS_DIR} (${BRANCH})"
@@ -75,8 +79,17 @@ pm2 start "bash ${OPS_DIR}/cto-collector/run_digest.sh" \
   --no-autorestart \
   --update-env
 
+echo "==> Start/restart PM2 daily cleanup (${PM2_CLEANUP_NAME})"
+pm2 delete "${PM2_CLEANUP_NAME}" >/dev/null 2>&1 || true
+pm2 start "bash ${OPS_DIR}/scripts/run-ops-cleanup.sh" \
+  --name "${PM2_CLEANUP_NAME}" \
+  --cron "${CLEANUP_CRON}" \
+  --no-autorestart \
+  --update-env
+
 pm2 save
 pm2 status
 
 echo "✅ Ops deploy complete."
 echo "Tip: pm2 logs ${PM2_COLLECTOR_NAME} --lines 120"
+echo "Tip: pm2 logs ${PM2_CLEANUP_NAME} --lines 120"
