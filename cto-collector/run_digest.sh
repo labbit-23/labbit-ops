@@ -6,7 +6,7 @@ if [[ -z "${CTO_BASE_URL:-}" || -z "${CTO_INGEST_TOKEN:-}" ]]; then
   exit 1
 fi
 
-PAYLOAD='{"drop_digested_day":true,"prune_raw_older_than_days":45}'
+PAYLOAD='{"drop_digested_day":false,"prune_healthy_older_than_days":7,"prune_nonhealthy_older_than_days":30}'
 
 curl -fsS -X POST "${CTO_BASE_URL%/}/api/cto/compact" \
   -H "Authorization: Bearer ${CTO_INGEST_TOKEN}" \
@@ -14,4 +14,3 @@ curl -fsS -X POST "${CTO_BASE_URL%/}/api/cto/compact" \
   -d "${PAYLOAD}"
 
 echo "cto digest compaction ok @ $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-
