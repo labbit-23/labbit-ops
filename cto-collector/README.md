@@ -21,6 +21,7 @@ CTO_BASE_URL=https://lab.sdrc.in
 CTO_INGEST_TOKEN=...
 CTO_LAB_ID=b539c161-1e2b-480b-9526-d4b37bd37b1e
 CTO_SOURCE=vps-hel1-1
+CTO_NODE_SUFFIX=vps1
 ```
 
 ## Optional env vars
@@ -33,6 +34,7 @@ CTO_DOCKER_BIN=docker
 CTO_ENABLE_DOCKER=1
 CTO_PM2_RESTART_STORM_DELTA=3
 CTO_EVENT_COOLDOWN_SECONDS=600
+CTO_NODE_SUFFIX=vps
 CTO_HOST_MEM_WARN_PCT=80
 CTO_HOST_MEM_CRITICAL_PCT=92
 CTO_HOST_DISK_WARN_PCT=85
@@ -77,6 +79,7 @@ CTO_BASE_URL=https://lab.sdrc.in \
 CTO_INGEST_TOKEN=... \
 CTO_LAB_ID=... \
 CTO_SOURCE=vps-hel1-1 \
+CTO_NODE_SUFFIX=vps1 \
 pm2 start "python3 cto-collector/collector.py" --name labbit-cto-collector
 pm2 save
 ```

@@ -68,6 +68,10 @@ def normalize_key(raw: str) -> str:
     return key or "unknown"
 
 
+def with_node_suffix(base_key: str, node_suffix: str) -> str:
+    return f"{base_key}__{normalize_key(node_suffix or 'vps')}"
+
+
 def post_json(url: str, token: str, payload: Dict[str, Any], timeout: int = 8) -> Tuple[bool, str]:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -173,12 +177,13 @@ def collect_pm2(
     services: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
     restart_map: Dict[str, int] = {}
+    runtime_key = with_node_suffix("pm2_runtime", config["node_suffix"])
 
     code, out, err = run_cmd([pm2_bin, "jlist"], timeout=8)
     if code != 0:
         events.append(
             {
-                "service_key": "pm2_runtime__vps",
+                "service_key": runtime_key,
                 "event_type": "pm2_jlist_failed",
                 "severity": "high",
                 "message": f"pm2 jlist failed: {err[:180]}",
@@ -188,7 +193,7 @@ def collect_pm2(
         )
         services.append(
             {
-                "service_key": "pm2_runtime__vps",
+                "service_key": runtime_key,
                 "category": "ops",
                 "label": "PM2 Runtime",
                 "status": "down",
@@ -207,7 +212,7 @@ def collect_pm2(
     row_infos: List[Dict[str, Any]] = []
     for row in rows:
         name = str(row.get("name") or "pm2_proc")
-        key = f"{normalize_key(name)}__vps"
+        key = with_node_suffix(normalize_key(name), config["node_suffix"])
         pm2_env = row.get("pm2_env") or {}
         monit = row.get("monit") or {}
         status = str(pm2_env.get("status") or "").lower()
@@ -360,6 +365,7 @@ def safe_read_float(path: str) -> float | None:
 def collect_host_metrics(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     services: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
+    host_service_key = with_node_suffix("vps_host", config["node_suffix"])
 
     meminfo = read_meminfo()
     mem_total_kb = meminfo.get("MemTotal")
@@ -441,7 +447,7 @@ def collect_host_metrics(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
 
     services.append(
         {
-            "service_key": "vps_host__vps",
+            "service_key": host_service_key,
             "category": "ops",
             "label": "VPS Host",
             "status": severity,
@@ -454,7 +460,7 @@ def collect_host_metrics(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
     if severity in {"degraded", "down"}:
         events.append(
             {
-                "service_key": "vps_host__vps",
+                "service_key": host_service_key,
                 "event_type": "vps_host_pressure",
                 "severity": "high" if severity == "down" else "medium",
                 "message": message[:240],
@@ -466,18 +472,21 @@ def collect_host_metrics(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
     return services, events
 
 
-def collect_docker(docker_bin: str, enabled: bool) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def collect_docker(
+    docker_bin: str, enabled: bool, config: Dict[str, Any]
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     if not enabled:
         return [], []
 
     services: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
+    runtime_key = with_node_suffix("docker_runtime", config["node_suffix"])
 
     code, out, err = run_cmd([docker_bin, "ps", "--format", "{{.Names}}|{{.Status}}"], timeout=8)
     if code != 0:
         events.append(
             {
-                "service_key": "docker_runtime__vps",
+                "service_key": runtime_key,
                 "event_type": "docker_ps_failed",
                 "severity": "medium",
                 "message": f"docker ps failed: {err[:180]}",
@@ -490,7 +499,7 @@ def collect_docker(docker_bin: str, enabled: bool) -> Tuple[List[Dict[str, Any]]
     lines = [line for line in out.splitlines() if line.strip()]
     for line in lines:
         name, status_raw = (line.split("|", 1) + [""])[:2]
-        key = f"docker_{normalize_key(name)}__vps"
+        key = with_node_suffix(f"docker_{normalize_key(name)}", config["node_suffix"])
         status_text = status_raw.lower()
 
         if "unhealthy" in status_text:
@@ -582,7 +591,9 @@ def run_cycle(config: Dict[str, Any], state: Dict[str, Any]) -> int:
     services.extend(host_services)
     events.extend(host_events)
 
-    docker_services, docker_events = collect_docker(config["docker_bin"], config["enable_docker"])
+    docker_services, docker_events = collect_docker(
+        config["docker_bin"], config["enable_docker"], config
+    )
     services.extend(docker_services)
     events.extend(docker_events)
 
@@ -646,6 +657,7 @@ def load_config() -> Dict[str, Any]:
         "token": os.environ["CTO_INGEST_TOKEN"],
         "lab_id": os.environ["CTO_LAB_ID"],
         "source": os.environ["CTO_SOURCE"],
+        "node_suffix": normalize_key(os.getenv("CTO_NODE_SUFFIX", "vps")),
         "interval_seconds": int(os.getenv("CTO_INTERVAL_SECONDS", "60")),
         "state_file": Path(os.getenv("CTO_STATE_FILE", "/var/tmp/labbit-cto-collector-state.json")),
         "pm2_bin": os.getenv("CTO_PM2_BIN", "pm2"),
