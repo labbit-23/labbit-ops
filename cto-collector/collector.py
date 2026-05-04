@@ -548,6 +548,16 @@ def read_recent_lines(path: str, max_lines: int = 160) -> List[str]:
     return lines[-max_lines:]
 
 
+def extract_last_error_at(lines: List[str]) -> str | None:
+    ts_re = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+    for raw in reversed(lines):
+        line = str(raw or "")
+        m = ts_re.search(line)
+        if m:
+            return m.group(1) + "Z"
+    return None
+
+
 def recent_error_signals(lines: List[str]) -> Dict[str, Any]:
     patterns = {
         "json_decode": re.compile(r"json\.decoder\.JSONDecodeError|JSONDecodeError", re.IGNORECASE),
@@ -589,6 +599,7 @@ def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[D
         err_lines = read_recent_lines(err_path, 220) if err_path else []
         out_lines = read_recent_lines(out_path, 120) if out_path else []
         err_signal = recent_error_signals(err_lines)
+        last_error_at = extract_last_error_at(err_lines)
 
         fetched_lines = [ln for ln in out_lines if "Fetched" in ln and "jobs" in ln]
         outside_window_lines = [ln for ln in out_lines if "Outside" in ln and "window" in ln]
@@ -600,7 +611,7 @@ def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[D
         if err_signal["total"] > 0:
             status = "down"
             severity = "high"
-            message = f"{name} recent errors={err_signal['total']} sample={err_signal['sample'] or '-'}"
+            message = f"{name} recent errors={err_signal['total']} last_error_at={last_error_at or '-'} sample={err_signal['sample'] or '-'}"
         elif fetched_lines and not outside_window_lines:
             status = "healthy"
             message = f"{name} active; fetched cycles={len(fetched_lines)}"
@@ -619,6 +630,7 @@ def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[D
                 "recent_error_total": err_signal["total"],
                 "recent_error_counts": err_signal["counts"],
                 "sample_error": err_signal["sample"],
+                "last_error_at": last_error_at,
                 "recent_fetched_cycles": len(fetched_lines),
             },
         })
@@ -634,6 +646,7 @@ def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[D
                     "error_total": err_signal["total"],
                     "error_counts": err_signal["counts"],
                     "error_sample": err_signal["sample"],
+                    "last_error_at": last_error_at,
                 },
                 "event_at": now_iso(),
             })
