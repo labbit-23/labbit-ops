@@ -16,8 +16,9 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -173,7 +174,7 @@ def compute_restarts_24h(
 
 def collect_pm2(
     pm2_bin: str, state: Dict[str, Any], config: Dict[str, Any]
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int], List[Dict[str, Any]]]:
     services: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
     restart_map: Dict[str, int] = {}
@@ -202,7 +203,7 @@ def collect_pm2(
                 "payload": {"error": err[:500]},
             }
         )
-        return services, events, restart_map
+        return services, events, restart_map, []
 
     try:
         rows = json.loads(out or "[]")
@@ -327,7 +328,7 @@ def collect_pm2(
                 }
             )
 
-    return services, events, restart_map
+    return services, events, restart_map, rows
 
 
 def read_meminfo() -> Dict[str, int]:
@@ -536,6 +537,262 @@ def collect_docker(
     return services, events
 
 
+def read_recent_lines(path: str, max_lines: int = 160) -> List[str]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            lines = handle.readlines()
+    except Exception:
+        return []
+    if max_lines <= 0:
+        return lines
+    return lines[-max_lines:]
+
+
+def recent_error_signals(lines: List[str]) -> Dict[str, Any]:
+    patterns = {
+        "json_decode": re.compile(r"json\.decoder\.JSONDecodeError|JSONDecodeError", re.IGNORECASE),
+        "http_error": re.compile(r"HTTPError|requests\.exceptions\.HTTPError|\b4\d\d Client Error\b|\b5\d\d Server Error\b", re.IGNORECASE),
+        "traceback": re.compile(r"Traceback \(most recent call last\)", re.IGNORECASE),
+        "exception": re.compile(r"\bException:\b|\berror\b", re.IGNORECASE),
+    }
+    counts = {key: 0 for key in patterns}
+    sample = None
+    for raw in lines:
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        for key, pat in patterns.items():
+            if pat.search(line):
+                counts[key] += 1
+                if sample is None:
+                    sample = line[:220]
+    total = sum(counts.values())
+    return {"total": total, "counts": counts, "sample": sample}
+
+
+def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    services: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
+    tracked = {"report-sender", "report-enqueue-watch"}
+
+    for row in pm2_rows:
+        name = str(row.get("name") or "").strip()
+        name_l = name.lower()
+        if name_l not in tracked:
+            continue
+
+        key = with_node_suffix(normalize_key(name), config["node_suffix"])
+        pm2_env = row.get("pm2_env") or {}
+        err_path = str(pm2_env.get("pm_err_log_path") or "")
+        out_path = str(pm2_env.get("pm_out_log_path") or "")
+
+        err_lines = read_recent_lines(err_path, 220) if err_path else []
+        out_lines = read_recent_lines(out_path, 120) if out_path else []
+        err_signal = recent_error_signals(err_lines)
+
+        fetched_lines = [ln for ln in out_lines if "Fetched" in ln and "jobs" in ln]
+        outside_window_lines = [ln for ln in out_lines if "Outside" in ln and "window" in ln]
+
+        status = "healthy"
+        message = "No hard errors in recent worker logs"
+        severity = None
+
+        if err_signal["total"] > 0:
+            status = "down"
+            severity = "high"
+            message = f"{name} recent errors={err_signal['total']} sample={err_signal['sample'] or '-'}"
+        elif fetched_lines and not outside_window_lines:
+            status = "healthy"
+            message = f"{name} active; fetched cycles={len(fetched_lines)}"
+
+        services.append({
+            "service_key": with_node_suffix(f"{normalize_key(name)}_log_health", config["node_suffix"]),
+            "category": "ops",
+            "label": f"{name} Log Health",
+            "status": status,
+            "latency_ms": None,
+            "message": message[:240],
+            "payload": {
+                "worker_service_key": key,
+                "error_log_path": err_path or None,
+                "out_log_path": out_path or None,
+                "recent_error_total": err_signal["total"],
+                "recent_error_counts": err_signal["counts"],
+                "sample_error": err_signal["sample"],
+                "recent_fetched_cycles": len(fetched_lines),
+            },
+        })
+
+        if severity:
+            events.append({
+                "service_key": key,
+                "event_type": "worker_log_error_spike",
+                "severity": severity,
+                "message": message[:240],
+                "payload": {
+                    "service": name,
+                    "error_total": err_signal["total"],
+                    "error_counts": err_signal["counts"],
+                    "error_sample": err_signal["sample"],
+                },
+                "event_at": now_iso(),
+            })
+
+    return services, events
+
+
+
+
+def supabase_rest_get(base_url: str, key: str, table: str, params: Dict[str, str], timeout: int = 8) -> Tuple[bool, Any, str]:
+    query = urllib.parse.urlencode(params, doseq=True)
+    url = f"{base_url.rstrip('/')}/rest/v1/{table}"
+    if query:
+        url = f"{url}?{query}"
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            data = json.loads(body or "[]")
+            return True, data, f"{getattr(resp, 'status', 200)}"
+    except urllib.error.HTTPError as exc:
+        return False, None, f"HTTP {exc.code}: {exc.reason}"
+    except Exception as exc:
+        return False, None, str(exc)
+
+
+def collect_dispatch_queue_signals(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    services: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
+
+    if not config.get("dispatch_checks_enabled"):
+        return services, events
+
+    base_url = str(config.get("supabase_url") or "").strip()
+    key = str(config.get("supabase_key") or "").strip()
+    jobs_table = str(config.get("dispatch_jobs_table") or "report_auto_dispatch_jobs").strip()
+    events_table = str(config.get("dispatch_events_table") or "report_auto_dispatch_events").strip()
+    if not base_url or not key:
+        return services, events
+
+    q_threshold = int(config.get("dispatch_queued_overdue_minutes", 30))
+    wait_hours = float(config.get("dispatch_stuck_queued_wait_hours", 6))
+    cool_hours = float(config.get("dispatch_stuck_cooling_off_hours", 2))
+    scan_limit = int(config.get("dispatch_scan_limit", 500))
+
+    now = datetime.now(timezone.utc)
+    queued_cutoff = (now - timedelta(minutes=q_threshold)).isoformat()
+
+    ok_q, queued_rows, err_q = supabase_rest_get(
+        base_url, key, jobs_table,
+        {
+            "select": "id,reqno,status,is_paused,next_attempt_at,updated_at",
+            "status": "eq.queued",
+            "is_paused": "eq.false",
+            "next_attempt_at": f"lte.{queued_cutoff}",
+            "order": "next_attempt_at.asc",
+            "limit": str(scan_limit),
+        },
+    )
+
+    if not ok_q:
+        events.append({
+            "service_key": with_node_suffix("auto_dispatch_queue", config["node_suffix"]),
+            "event_type": "dispatch_queue_check_failed",
+            "severity": "medium",
+            "message": f"queue overdue check failed: {err_q}",
+            "payload": {"error": err_q},
+            "event_at": now_iso(),
+        })
+        return services, events
+
+    queued_rows = queued_rows or []
+
+    ok_e, ev_rows, err_e = supabase_rest_get(
+        base_url, key, events_table,
+        {
+            "select": "job_id,reqno,event_type,created_at",
+            "event_type": "in.(queued_wait,cooling_off)",
+            "order": "created_at.desc",
+            "limit": str(scan_limit * 3),
+        },
+    )
+    if not ok_e:
+        ev_rows = []
+        err_e = err_e
+
+    latest_by_job = {}
+    for r in (ev_rows or []):
+        jid = r.get("job_id")
+        if not jid or jid in latest_by_job:
+            continue
+        latest_by_job[jid] = r
+
+    stale = []
+    for ev in latest_by_job.values():
+        created = ev.get("created_at")
+        try:
+            dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        age_h = (now - dt).total_seconds() / 3600.0
+        et = str(ev.get("event_type") or "").lower()
+        if (et == "queued_wait" and age_h >= wait_hours) or (et == "cooling_off" and age_h >= cool_hours):
+            stale.append({"job_id": ev.get("job_id"), "reqno": ev.get("reqno"), "event_type": et, "age_hours": round(age_h, 2), "created_at": created})
+
+    queue_status = "healthy" if len(queued_rows) == 0 else ("degraded" if len(queued_rows) < 10 else "down")
+    wait_status = "healthy" if len(stale) == 0 else ("degraded" if len(stale) < 10 else "down")
+
+    services.append({
+        "service_key": with_node_suffix("auto_dispatch_queued_overdue", config["node_suffix"]),
+        "category": "ops",
+        "label": "Auto Dispatch Queued Overdue",
+        "status": queue_status,
+        "latency_ms": None,
+        "message": f"{len(queued_rows)} queued jobs overdue > {q_threshold}m",
+        "payload": {"count": len(queued_rows), "threshold_minutes": q_threshold, "samples": queued_rows[:25]},
+    })
+
+    services.append({
+        "service_key": with_node_suffix("auto_dispatch_wait_state_stuck", config["node_suffix"]),
+        "category": "ops",
+        "label": "Auto Dispatch Wait-State Stuck",
+        "status": wait_status,
+        "latency_ms": None,
+        "message": f"{len(stale)} wait-state jobs stale (queued_wait>{wait_hours}h, cooling_off>{cool_hours}h)",
+        "payload": {"count": len(stale), "queued_wait_hours": wait_hours, "cooling_off_hours": cool_hours, "samples": stale[:25], "events_lookup_error": err_e if not ok_e else None},
+    })
+
+    if len(queued_rows) > 0:
+        events.append({
+            "service_key": with_node_suffix("auto_dispatch_queue", config["node_suffix"]),
+            "event_type": "queued_overdue",
+            "severity": "high" if len(queued_rows) >= 10 else "medium",
+            "message": f"{len(queued_rows)} queued jobs overdue by > {q_threshold}m",
+            "payload": {"count": len(queued_rows), "threshold_minutes": q_threshold, "samples": queued_rows[:20]},
+            "event_at": now_iso(),
+        })
+
+    if len(stale) > 0:
+        events.append({
+            "service_key": with_node_suffix("auto_dispatch_queue", config["node_suffix"]),
+            "event_type": "wait_state_stuck",
+            "severity": "high" if len(stale) >= 10 else "medium",
+            "message": f"{len(stale)} dispatch jobs stuck in queued_wait/cooling_off",
+            "payload": {"count": len(stale), "queued_wait_hours": wait_hours, "cooling_off_hours": cool_hours, "samples": stale[:20]},
+            "event_at": now_iso(),
+        })
+
+    return services, events
+
+
 def apply_restart_storm_events(
     events: List[Dict[str, Any]],
     prev_restarts: Dict[str, int],
@@ -583,9 +840,17 @@ def run_cycle(config: Dict[str, Any], state: Dict[str, Any]) -> int:
     services: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
 
-    pm2_services, pm2_events, restart_map = collect_pm2(config["pm2_bin"], state, config)
+    pm2_services, pm2_events, restart_map, pm2_rows = collect_pm2(config["pm2_bin"], state, config)
     services.extend(pm2_services)
     events.extend(pm2_events)
+
+    worker_log_services, worker_log_events = collect_dispatch_worker_log_signals(config, pm2_rows)
+    services.extend(worker_log_services)
+    events.extend(worker_log_events)
+
+    dispatch_services, dispatch_events = collect_dispatch_queue_signals(config)
+    services.extend(dispatch_services)
+    events.extend(dispatch_events)
 
     host_services, host_events = collect_host_metrics(config)
     services.extend(host_services)
