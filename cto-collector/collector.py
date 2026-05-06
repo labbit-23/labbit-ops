@@ -567,17 +567,33 @@ def recent_error_signals(lines: List[str]) -> Dict[str, Any]:
     }
     counts = {key: 0 for key in patterns}
     sample = None
+    actionable_sample = None
+    actionable_total = 0
     for raw in lines:
         line = str(raw or "").strip()
         if not line:
             continue
+        is_actionable_line = False
         for key, pat in patterns.items():
             if pat.search(line):
                 counts[key] += 1
                 if sample is None:
                     sample = line[:220]
+                # Treat traceback header alone as non-actionable noise.
+                if key != "traceback":
+                    is_actionable_line = True
+        if is_actionable_line:
+            actionable_total += 1
+            if actionable_sample is None:
+                actionable_sample = line[:220]
     total = sum(counts.values())
-    return {"total": total, "counts": counts, "sample": sample}
+    return {
+        "total": total,
+        "counts": counts,
+        "sample": sample,
+        "actionable_total": actionable_total,
+        "actionable_sample": actionable_sample,
+    }
 
 
 def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -608,10 +624,20 @@ def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[D
         message = "No hard errors in recent worker logs"
         severity = None
 
-        if err_signal["total"] > 0:
+        if err_signal.get("actionable_total", 0) > 0:
             status = "down"
             severity = "high"
-            message = f"{name} recent errors={err_signal['total']} last_error_at={last_error_at or '-'} sample={err_signal['sample'] or '-'}"
+            message = (
+                f"{name} recent actionable_errors={err_signal.get('actionable_total', 0)} "
+                f"raw_errors={err_signal.get('total', 0)} last_error_at={last_error_at or '-'} "
+                f"sample={err_signal.get('actionable_sample') or err_signal.get('sample') or '-'}"
+            )
+        elif err_signal["total"] > 0:
+            status = "healthy"
+            message = (
+                f"{name} non-actionable log noise raw_errors={err_signal.get('total', 0)} "
+                f"last_error_at={last_error_at or '-'} sample={err_signal.get('sample') or '-'}"
+            )
         elif fetched_lines and not outside_window_lines:
             status = "healthy"
             message = f"{name} active; fetched cycles={len(fetched_lines)}"
@@ -630,6 +656,8 @@ def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[D
                 "recent_error_total": err_signal["total"],
                 "recent_error_counts": err_signal["counts"],
                 "sample_error": err_signal["sample"],
+                "recent_actionable_error_total": err_signal.get("actionable_total", 0),
+                "sample_actionable_error": err_signal.get("actionable_sample"),
                 "last_error_at": last_error_at,
                 "recent_fetched_cycles": len(fetched_lines),
             },
@@ -643,9 +671,10 @@ def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[D
                 "message": message[:240],
                 "payload": {
                     "service": name,
-                    "error_total": err_signal["total"],
+                    "error_total": err_signal.get("actionable_total", 0),
+                    "raw_error_total": err_signal.get("total", 0),
                     "error_counts": err_signal["counts"],
-                    "error_sample": err_signal["sample"],
+                    "error_sample": err_signal.get("actionable_sample") or err_signal.get("sample"),
                     "last_error_at": last_error_at,
                 },
                 "event_at": now_iso(),
