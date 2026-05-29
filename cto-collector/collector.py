@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Tuple
 
 
 RESTART_WINDOW_SECONDS = 24 * 60 * 60
+MIN_ACTIONABLE_ERRORS_FOR_EVENT = 10  # Only log worker log error event when >5 actionable errors (avoid noise from 1-2 transient errors)
 
 
 def now_iso() -> str:
@@ -624,9 +625,9 @@ def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[D
         message = "No hard errors in recent worker logs"
         severity = None
 
-        if err_signal.get("actionable_total", 0) > 0:
-            status = "down"
-            severity = "high"
+        if err_signal.get("actionable_total", 0) >= MIN_ACTIONABLE_ERRORS_FOR_EVENT:
+            status = "degraded"
+            severity = "medium"
             message = (
                 f"{name} recent actionable_errors={err_signal.get('actionable_total', 0)} "
                 f"raw_errors={err_signal.get('total', 0)} last_error_at={last_error_at or '-'} "
