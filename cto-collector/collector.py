@@ -549,6 +549,17 @@ def read_recent_lines(path: str, max_lines: int = 160) -> List[str]:
     return lines[-max_lines:]
 
 
+def read_json_file(path: str) -> Dict[str, Any]:
+    try:
+        if not path:
+            return {}
+        with open(path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
 def extract_last_error_at(lines: List[str]) -> str | None:
     ts_re = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
     for raw in reversed(lines):
@@ -597,10 +608,95 @@ def recent_error_signals(lines: List[str]) -> Dict[str, Any]:
     }
 
 
+def parse_worker_log_timestamp(line: str) -> datetime | None:
+    match = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", str(line or ""))
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def latest_worker_log_activity(lines: List[str]) -> Tuple[datetime | None, str | None]:
+    for raw in reversed(lines):
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        parsed = parse_worker_log_timestamp(line)
+        if parsed:
+            return parsed, line[:220]
+    return None, None
+
+
+def latest_logged_sleep_seconds(lines: List[str]) -> int | None:
+    pattern = re.compile(r"Sleeping\s+(\d+)\s+seconds\s+before\s+next\s+enqueue\s+cycle", re.IGNORECASE)
+    for raw in reversed(lines):
+        line = str(raw or "")
+        match = pattern.search(line)
+        if not match:
+            continue
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def enqueue_expected_sleep_seconds(report_sender_cfg: Dict[str, Any]) -> int | None:
+    enqueue_cfg = report_sender_cfg.get("enqueue") if isinstance(report_sender_cfg, dict) else {}
+    if not isinstance(enqueue_cfg, dict):
+        return None
+
+    now = datetime.now()
+    hhmm = now.hour * 100 + now.minute
+    boundary = int(enqueue_cfg.get("poll_fast_after_hhmm") or enqueue_cfg.get("poll_post_boundary_hhmm") or 1000)
+    key = "poll_seconds_pre_10am" if hhmm < boundary else "poll_seconds_post_10am"
+    try:
+        return int(enqueue_cfg.get(key))
+    except Exception:
+        return None
+
+
+def sender_expected_sleep_seconds(report_sender_cfg: Dict[str, Any]) -> int | None:
+    worker_cfg = report_sender_cfg.get("worker") if isinstance(report_sender_cfg, dict) else {}
+    if not isinstance(worker_cfg, dict):
+        return None
+    try:
+        return int(worker_cfg.get("poll_seconds"))
+    except Exception:
+        return None
+
+
+def expected_worker_log_age_seconds(name_l: str, lines: List[str], report_sender_cfg: Dict[str, Any], grace_seconds: int) -> Tuple[int | None, Dict[str, Any]]:
+    logged_sleep = latest_logged_sleep_seconds(lines) if name_l == "report-enqueue-watch" else None
+    configured_sleep = (
+        enqueue_expected_sleep_seconds(report_sender_cfg)
+        if name_l == "report-enqueue-watch"
+        else sender_expected_sleep_seconds(report_sender_cfg)
+    )
+    sleep_seconds = logged_sleep if isinstance(logged_sleep, int) and logged_sleep > 0 else configured_sleep
+    if not isinstance(sleep_seconds, int) or sleep_seconds <= 0:
+        return None, {
+            "logged_sleep_seconds": logged_sleep,
+            "configured_sleep_seconds": configured_sleep,
+        }
+
+    allowed = int(sleep_seconds + max(60, grace_seconds))
+    return allowed, {
+        "logged_sleep_seconds": logged_sleep,
+        "configured_sleep_seconds": configured_sleep,
+        "allowed_log_age_seconds": allowed,
+        "stale_grace_seconds": max(60, grace_seconds),
+    }
+
+
 def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     services: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
     tracked = {"report-sender", "report-enqueue-watch"}
+    report_sender_cfg = read_json_file(str(config.get("report_sender_config_path") or ""))
+    stale_grace_seconds = int(config.get("worker_log_stale_grace_seconds", 300))
 
     for row in pm2_rows:
         name = str(row.get("name") or "").strip()
@@ -615,11 +711,22 @@ def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[D
 
         err_lines = read_recent_lines(err_path, 220) if err_path else []
         out_lines = read_recent_lines(out_path, 120) if out_path else []
+        all_lines = err_lines + out_lines
         err_signal = recent_error_signals(err_lines)
         last_error_at = extract_last_error_at(err_lines)
+        last_activity_at, last_activity_line = latest_worker_log_activity(all_lines)
+        max_log_age_seconds, cadence_payload = expected_worker_log_age_seconds(
+            name_l,
+            all_lines,
+            report_sender_cfg,
+            stale_grace_seconds,
+        )
+        log_age_seconds = None
+        if last_activity_at:
+            log_age_seconds = max(0, int((datetime.now() - last_activity_at).total_seconds()))
 
-        fetched_lines = [ln for ln in out_lines if "Fetched" in ln and "jobs" in ln]
-        outside_window_lines = [ln for ln in out_lines if "Outside" in ln and "window" in ln]
+        fetched_lines = [ln for ln in all_lines if "Fetched" in ln and "jobs" in ln]
+        outside_window_lines = [ln for ln in all_lines if "Outside" in ln and "window" in ln]
 
         status = "healthy"
         message = "No hard errors in recent worker logs"
@@ -643,6 +750,19 @@ def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[D
             status = "healthy"
             message = f"{name} active; fetched cycles={len(fetched_lines)}"
 
+        if (
+            status == "healthy"
+            and isinstance(log_age_seconds, int)
+            and isinstance(max_log_age_seconds, int)
+            and log_age_seconds > max_log_age_seconds
+        ):
+            status = "down"
+            severity = "high"
+            message = (
+                f"{name} stale log heartbeat age_min={log_age_seconds // 60} "
+                f"allowed_min={max_log_age_seconds // 60}"
+            )
+
         services.append({
             "service_key": with_node_suffix(f"{normalize_key(name)}_log_health", config["node_suffix"]),
             "category": "ops",
@@ -661,13 +781,18 @@ def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[D
                 "sample_actionable_error": err_signal.get("actionable_sample"),
                 "last_error_at": last_error_at,
                 "recent_fetched_cycles": len(fetched_lines),
+                "last_activity_at": last_activity_at.isoformat() if last_activity_at else None,
+                "last_activity_line": last_activity_line,
+                "log_age_seconds": log_age_seconds,
+                "report_sender_config_path": str(config.get("report_sender_config_path") or ""),
+                **cadence_payload,
             },
         })
 
         if severity:
             events.append({
                 "service_key": key,
-                "event_type": "worker_log_error_spike",
+                "event_type": "worker_log_stale" if status == "down" and isinstance(log_age_seconds, int) else "worker_log_error_spike",
                 "severity": severity,
                 "message": message[:240],
                 "payload": {
@@ -677,6 +802,9 @@ def collect_dispatch_worker_log_signals(config: Dict[str, Any], pm2_rows: List[D
                     "error_counts": err_signal["counts"],
                     "error_sample": err_signal.get("actionable_sample") or err_signal.get("sample"),
                     "last_error_at": last_error_at,
+                    "last_activity_at": last_activity_at.isoformat() if last_activity_at else None,
+                    "log_age_seconds": log_age_seconds,
+                    **cadence_payload,
                 },
                 "event_at": now_iso(),
             })
@@ -981,6 +1109,8 @@ def load_config() -> Dict[str, Any]:
         "scheduled_pm2_names": parse_csv_lower(os.getenv("CTO_SCHEDULED_PM2_NAMES", "labbit-cto-digest")),
         "scheduled_job_warn_age_seconds": int(os.getenv("CTO_SCHEDULED_JOB_WARN_AGE_SECONDS", str(30 * 60 * 60))),
         "scheduled_job_max_age_seconds": int(os.getenv("CTO_SCHEDULED_JOB_MAX_AGE_SECONDS", str(36 * 60 * 60))),
+        "report_sender_config_path": os.getenv("CTO_REPORT_SENDER_CONFIG_PATH", "/opt/py_utils/workers/report_sender/config/report_sender.json"),
+        "worker_log_stale_grace_seconds": int(os.getenv("CTO_WORKER_LOG_STALE_GRACE_SECONDS", "300")),
     }
 
 
