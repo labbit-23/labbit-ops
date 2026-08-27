@@ -219,8 +219,10 @@ def collect_pm2(
         monit = row.get("monit") or {}
         status = str(pm2_env.get("status") or "").lower()
         restarts = int(pm2_env.get("restart_time") or 0)
-        # Accumulate so a multi-instance app's restart tracking works on the aggregate.
-        restart_map[key] = restart_map.get(key, 0) + restarts
+        # For a multi-instance app track the worst single instance, not the sum: a
+        # cluster reload restarts every instance at once and summing would make one
+        # reload look like N restarts and trip the restart-storm signal.
+        restart_map[key] = max(restart_map.get(key, 0), restarts)
         raw_infos.append(
             {
                 "name": name,
@@ -268,7 +270,7 @@ def collect_pm2(
             "name": members[0]["name"],
             "key": key,
             "status": worst["status"],
-            "restarts": sum(int(m["restarts"] or 0) for m in members),
+            "restarts": max(int(m["restarts"] or 0) for m in members),
             "cpu": _sum([m["cpu"] for m in members]),
             "memory": _sum([m["memory"] for m in members]),
             "out_log_path": members[0]["out_log_path"],
