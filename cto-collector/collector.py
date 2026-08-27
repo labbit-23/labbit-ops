@@ -211,7 +211,7 @@ def collect_pm2(
     except Exception:
         rows = []
 
-    row_infos: List[Dict[str, Any]] = []
+    raw_infos: List[Dict[str, Any]] = []
     for row in rows:
         name = str(row.get("name") or "pm2_proc")
         key = with_node_suffix(normalize_key(name), config["node_suffix"])
@@ -219,8 +219,9 @@ def collect_pm2(
         monit = row.get("monit") or {}
         status = str(pm2_env.get("status") or "").lower()
         restarts = int(pm2_env.get("restart_time") or 0)
-        restart_map[key] = restarts
-        row_infos.append(
+        # Accumulate so a multi-instance app's restart tracking works on the aggregate.
+        restart_map[key] = restart_map.get(key, 0) + restarts
+        raw_infos.append(
             {
                 "name": name,
                 "key": key,
@@ -230,8 +231,82 @@ def collect_pm2(
                 "memory": monit.get("memory"),
                 "out_log_path": str(pm2_env.get("pm_out_log_path") or ""),
                 "cron_restart": str(pm2_env.get("cron_restart") or ""),
+                "exec_mode": str(pm2_env.get("exec_mode") or "").lower(),
+                "pm_id": row.get("pm_id"),
             }
         )
+
+    # Collapse multiple pm2 processes that share a service_key (e.g. a Next.js app run
+    # as a cluster_mode app with instances>1) into ONE monitoring row. Emitting one row
+    # per instance would send duplicate service_key values and make the /api/cto/ingest
+    # upsert fail wholesale (Postgres 21000 "ON CONFLICT DO UPDATE ... a second time").
+    _STATUS_RANK = {
+        "online": 0, "waiting restart": 1, "launching": 2, "one-launch-status": 2,
+        "stopping": 3, "stopped": 4, "errored": 5,
+    }
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    order: List[str] = []
+    for info in raw_infos:
+        if info["key"] not in grouped:
+            grouped[info["key"]] = []
+            order.append(info["key"])
+        grouped[info["key"]].append(info)
+
+    def _sum(values: List[Any]) -> Any:
+        nums = [v for v in values if isinstance(v, (int, float))]
+        return sum(nums) if nums else None
+
+    row_infos: List[Dict[str, Any]] = []
+    for key in order:
+        members = grouped[key]
+        if len(members) == 1:
+            row_infos.append({**members[0], "instance_count": 1})
+            continue
+        worst = max(members, key=lambda m: _STATUS_RANK.get(m["status"], 2))
+        cluster = all(m["exec_mode"] == "cluster_mode" for m in members)
+        merged = {
+            "name": members[0]["name"],
+            "key": key,
+            "status": worst["status"],
+            "restarts": sum(int(m["restarts"] or 0) for m in members),
+            "cpu": _sum([m["cpu"] for m in members]),
+            "memory": _sum([m["memory"] for m in members]),
+            "out_log_path": members[0]["out_log_path"],
+            "cron_restart": members[0]["cron_restart"],
+            "exec_mode": members[0]["exec_mode"],
+            "pm_id": members[0]["pm_id"],
+            "instance_count": len(members),
+            "expected_cluster": cluster,
+            "per_instance": [
+                {"pm_id": m["pm_id"], "status": m["status"], "restarts": m["restarts"],
+                 "cpu": m["cpu"], "memory": m["memory"], "exec_mode": m["exec_mode"]}
+                for m in members
+            ],
+        }
+        row_infos.append(merged)
+
+        if not cluster:
+            # Same pm2 name running >1 process without cluster_mode => likely an
+            # orphaned/duplicate process from a bad deploy. Worth a look.
+            events.append(
+                {
+                    "service_key": key,
+                    "event_type": "pm2_duplicate_process",
+                    "severity": "medium",
+                    "message": (
+                        f"{members[0]['name']}: {len(members)} pm2 processes share this name "
+                        f"but exec_mode is not cluster_mode ({sorted({m['exec_mode'] or 'unknown' for m in members})}) "
+                        f"- possible duplicate/orphaned process"
+                    ),
+                    "payload": {
+                        "instance_count": len(members),
+                        "pm_ids": [m["pm_id"] for m in members],
+                        "exec_modes": sorted({m["exec_mode"] or "unknown" for m in members}),
+                        "statuses": [m["status"] for m in members],
+                    },
+                    "event_at": now_iso(),
+                }
+            )
 
     restarts_24h_map = compute_restarts_24h(state, restart_map, int(time.time()))
 
@@ -276,7 +351,16 @@ def collect_pm2(
         else:
             norm_status = "unknown"
 
+        instance_count = int(info.get("instance_count", 1))
+        is_unexpected_dupe = instance_count > 1 and not info.get("expected_cluster", False)
+        if is_unexpected_dupe and norm_status in {"healthy", "unknown"}:
+            norm_status = "degraded"
+
         msg = f"pm2={status or 'unknown'} restarts_24h={restarts_24h} restarts_total={restarts}"
+        if instance_count > 1:
+            msg += f" instances={instance_count}"
+            if is_unexpected_dupe:
+                msg += " (DUPLICATE - not cluster_mode)"
         if is_scheduled_job:
             log_age = file_age_seconds(out_log_path) if out_log_path else None
             if log_age is None:
@@ -305,6 +389,10 @@ def collect_pm2(
                     "scheduled_job": is_scheduled_job,
                     "pm2_cron_restart": cron_restart or None,
                     "out_log_path": out_log_path or None,
+                    "instance_count": instance_count,
+                    "expected_cluster": info.get("expected_cluster", instance_count == 1),
+                    "unexpected_duplicate": is_unexpected_dupe,
+                    "per_instance": info.get("per_instance"),
                 },
             }
         )
