@@ -20,3 +20,6 @@ venv/
 
 # Logs
 *.log
+
+# Local repository recovery sets (Git bundles and worktree patches)
+local-backups/
