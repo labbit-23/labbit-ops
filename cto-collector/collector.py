@@ -126,8 +126,9 @@ def compute_restarts_24h(
     state: Dict[str, Any],
     restart_map: Dict[str, int],
     now_ts: int,
+    state_key: str = "pm2_restart_samples",
 ) -> Dict[str, int]:
-    history = state.setdefault("pm2_restart_samples", {})
+    history = state.setdefault(state_key, {})
     cutoff = now_ts - RESTART_WINDOW_SECONDS
     restarts_24h: Dict[str, int] = {}
 
@@ -179,6 +180,7 @@ def collect_pm2(
     services: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
     restart_map: Dict[str, int] = {}
+    unstable_restart_map: Dict[str, int] = {}
     runtime_key = with_node_suffix("pm2_runtime", config["node_suffix"])
 
     code, out, err = run_cmd([pm2_bin, "jlist"], timeout=8)
@@ -219,16 +221,28 @@ def collect_pm2(
         monit = row.get("monit") or {}
         status = str(pm2_env.get("status") or "").lower()
         restarts = int(pm2_env.get("restart_time") or 0)
+        # unstable_restarts is pm2's OWN crash-loop counter -- it only increments
+        # when pm2 restarts a process that exited too soon after starting, unlike
+        # restart_time, which increments identically for a genuine crash AND for
+        # every deliberate `pm2 restart`/`reload` (a normal zero-downtime deploy).
+        # Confirmed live 2026-09-25: labit-ui and labbit-frontend both sat at
+        # unstable_restarts=0 with restart_time in the teens purely from routine
+        # deploys, while the restart_time-based signal below was flagging them
+        # "down"/critical every time -- exactly the false-alarm noise that trained
+        # everyone to stop trusting the dashboard.
+        unstable_restarts = int(pm2_env.get("unstable_restarts") or 0)
         # For a multi-instance app track the worst single instance, not the sum: a
         # cluster reload restarts every instance at once and summing would make one
         # reload look like N restarts and trip the restart-storm signal.
         restart_map[key] = max(restart_map.get(key, 0), restarts)
+        unstable_restart_map[key] = max(unstable_restart_map.get(key, 0), unstable_restarts)
         raw_infos.append(
             {
                 "name": name,
                 "key": key,
                 "status": status,
                 "restarts": restarts,
+                "unstable_restarts": unstable_restarts,
                 "cpu": monit.get("cpu"),
                 "memory": monit.get("memory"),
                 "out_log_path": str(pm2_env.get("pm_out_log_path") or ""),
@@ -271,6 +285,7 @@ def collect_pm2(
             "key": key,
             "status": worst["status"],
             "restarts": max(int(m["restarts"] or 0) for m in members),
+            "unstable_restarts": max(int(m["unstable_restarts"] or 0) for m in members),
             "cpu": _sum([m["cpu"] for m in members]),
             "memory": _sum([m["memory"] for m in members]),
             "out_log_path": members[0]["out_log_path"],
@@ -310,7 +325,11 @@ def collect_pm2(
                 }
             )
 
-    restarts_24h_map = compute_restarts_24h(state, restart_map, int(time.time()))
+    now_ts = int(time.time())
+    restarts_24h_map = compute_restarts_24h(state, restart_map, now_ts)
+    unstable_restarts_24h_map = compute_restarts_24h(
+        state, unstable_restart_map, now_ts, state_key="pm2_unstable_restart_samples"
+    )
 
     for info in row_infos:
         name = info["name"]
@@ -322,6 +341,7 @@ def collect_pm2(
         out_log_path = info.get("out_log_path") or ""
         cron_restart = info.get("cron_restart") or ""
         restarts_24h = int(restarts_24h_map.get(key, 0))
+        unstable_restarts_24h = int(unstable_restarts_24h_map.get(key, 0))
         scheduled_names = config.get("scheduled_pm2_names", [])
         is_scheduled_job = str(name or "").strip().lower() in scheduled_names
 
@@ -343,10 +363,14 @@ def collect_pm2(
             else:
                 norm_status = "down"
         elif status == "online":
+            # Gate on unstable_restarts (pm2's own crash-loop counter), not raw
+            # restart_time -- restart_time also climbs on every deliberate
+            # deploy restart/reload, which isn't instability. See the comment
+            # where unstable_restarts is read, above.
             norm_status = "healthy"
-            if restarts_24h >= 3:
+            if unstable_restarts_24h >= 3:
                 norm_status = "down"
-            elif restarts_24h >= 1:
+            elif unstable_restarts_24h >= 1:
                 norm_status = "degraded"
         elif status in {"launching", "stopping", "errored"}:
             norm_status = "down"
@@ -358,7 +382,10 @@ def collect_pm2(
         if is_unexpected_dupe and norm_status in {"healthy", "unknown"}:
             norm_status = "degraded"
 
-        msg = f"pm2={status or 'unknown'} restarts_24h={restarts_24h} restarts_total={restarts}"
+        msg = (
+            f"pm2={status or 'unknown'} restarts_24h={restarts_24h} restarts_total={restarts} "
+            f"unstable_restarts_24h={unstable_restarts_24h}"
+        )
         if instance_count > 1:
             msg += f" instances={instance_count}"
             if is_unexpected_dupe:
@@ -386,6 +413,8 @@ def collect_pm2(
                     "pm2_status": status,
                     "restarts": restarts,
                     "restarts_24h": restarts_24h,
+                    "unstable_restarts": unstable_restarts,
+                    "unstable_restarts_24h": unstable_restarts_24h,
                     "cpu": cpu,
                     "memory": mem,
                     "scheduled_job": is_scheduled_job,
@@ -408,12 +437,13 @@ def collect_pm2(
                     "message": (
                         f"{name} is {status or 'down'}"
                         if status != "online"
-                        else f"{name} restart volume high in 24h: {restarts_24h}"
+                        else f"{name} unstable restarts high in 24h: {unstable_restarts_24h}"
                     ),
                     "payload": {
                         "pm2_status": status,
                         "restarts": restarts,
                         "restarts_24h": restarts_24h,
+                        "unstable_restarts_24h": unstable_restarts_24h,
                     },
                     "event_at": now_iso(),
                 }
