@@ -11,7 +11,8 @@ It is designed to be lightweight and safe on production VPS.
 ## Files
 
 - `collector.py`: main collector loop (PM2 + VPS host + Docker signals)
-- `run_digest.sh`: daily digest trigger for `/api/cto/compact`
+- `run_digest.sh`: daily digest trigger; runs `digest.py`
+- `digest.py`: compacts one UTC day of `cto_service_logs` into `cto_service_daily_digest` directly in Postgres and prunes old raw rows (healthy > 7d, non-healthy > 30d)
 - `../scripts/run-ops-cleanup.sh`: daily maintenance cleanup (filesystem + optional DB staging tables)
 
 ## Required env vars
@@ -89,9 +90,9 @@ pm2 save
 ## Daily digest compaction (PM2 cron)
 
 ```bash
+# Needs CTO_DB_DSN in cto-collector/.env (a role limited to the cto_service_* tables)
+# and a venv with psycopg: python3 -m venv .venv && .venv/bin/pip install "psycopg[binary]"
 cd /opt/labbit-ops
-CTO_BASE_URL=https://lab.sdrc.in \
-CTO_INGEST_TOKEN=... \
 pm2 start "bash cto-collector/run_digest.sh" \
   --name labbit-cto-digest \
   --cron "20 1 * * *" \
@@ -113,6 +114,6 @@ pm2 save
 
 ## Backfill digest once
 
-Run SQL file:
+Run SQL file, or `cto-collector/digest.py --day YYYY-MM-DD` per day (`--dry-run` to preview):
 
 - `../labbit-ops/sql/cto-digest-backfill.sql`
