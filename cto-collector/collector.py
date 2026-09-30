@@ -97,6 +97,69 @@ def post_json(url: str, token: str, payload: Dict[str, Any], timeout: int = 8) -
         return False, str(exc)
 
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def now_ist_str() -> str:
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
+
+
+def send_ops_whatsapp_alert(config: Dict[str, Any], category: str, subject: str, status: str) -> None:
+    """POST to labit-main's staff-notify using the ops_status_alert WhatsApp
+    template -- same mechanism and template as labit-py's WAN-down alert
+    (monitoring_agent.py's _send_ops_alert), reused here for host resource
+    pressure (memory/disk/swap) so both alert families land the same way,
+    to the same ops_alert_numbers list. Silently skipped, with a log line,
+    when alert_notify_url/alert_notify_token aren't configured -- this
+    collector must keep collecting even if alerting isn't set up.
+    """
+    notify_url = config.get("alert_notify_url", "")
+    notify_token = config.get("alert_notify_token", "")
+    if not notify_url or not notify_token:
+        print(
+            f"[cto-collector] ops alert skipped for {category}: {subject} ({status}): "
+            "CTO_ALERT_NOTIFY_URL/CTO_ALERT_NOTIFY_TOKEN not configured",
+            flush=True,
+        )
+        return
+
+    payload = {
+        "lab_id": config.get("alert_lab_id") or config["lab_id"],
+        "template_name": config.get("alert_template_name", "ops_status_alert"),
+        "language_code": config.get("alert_language_code", "en"),
+        "template_params": [category, subject, status, now_ist_str()],
+        "source_service": "cto-collector-host-pressure",
+    }
+    ok, msg = post_json(notify_url, notify_token, payload)
+    if ok:
+        print(f"[cto-collector] ops alert sent: {category} / {subject} is now {status}", flush=True)
+    else:
+        print(f"[cto-collector] ops alert send failed ({msg}): {category} / {subject} ({status})", flush=True)
+
+
+def maybe_alert_host_pressure_transition(
+    state: Dict[str, Any], config: Dict[str, Any], host_service_key: str, label: str, severity: str, reasons: List[str]
+) -> None:
+    """Fire a WhatsApp alert only when a host's pressure severity actually
+    CHANGES (healthy <-> degraded <-> down), never on every poll -- mirrors
+    labit-py monitoring_agent.py's maybe_alert_wan_transitions so a restart
+    of this collector never re-fires a false transition for state that
+    hasn't changed (state survives restarts via the existing state file).
+    """
+    severity_state = state.setdefault("host_pressure_severity", {})
+    previous = severity_state.get(host_service_key)
+    if previous == severity:
+        return
+    severity_state[host_service_key] = severity
+    if previous is None:
+        # First observation ever for this host -- record the baseline,
+        # don't alert (nothing "changed" yet).
+        return
+    status_text = "OK" if severity == "healthy" else severity.upper()
+    subject = f"{label} ({', '.join(reasons)})" if severity != "healthy" else label
+    send_ops_whatsapp_alert(config, "Infrastructure", subject, status_text)
+
+
 def initial_state() -> Dict[str, Any]:
     return {
         "pm2_restarts": {},
@@ -484,7 +547,7 @@ def safe_read_float(path: str) -> float | None:
         return None
 
 
-def collect_host_metrics(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def collect_host_metrics(config: Dict[str, Any], state: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     services: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
     host_service_key = with_node_suffix("vps_host", config["node_suffix"])
@@ -551,6 +614,8 @@ def collect_host_metrics(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         reasons.append("host pressure nominal")
 
     message = " | ".join(reasons)
+
+    maybe_alert_host_pressure_transition(state, config, host_service_key, config.get("host_label", host_service_key), severity, reasons)
 
     payload = {
         "memory_pct": round(mem_pct, 2) if isinstance(mem_pct, float) else None,
@@ -1143,7 +1208,7 @@ def run_cycle(config: Dict[str, Any], state: Dict[str, Any]) -> int:
     services.extend(dispatch_services)
     events.extend(dispatch_events)
 
-    host_services, host_events = collect_host_metrics(config)
+    host_services, host_events = collect_host_metrics(config, state)
     services.extend(host_services)
     events.extend(host_events)
 
@@ -1227,6 +1292,12 @@ def load_config() -> Dict[str, Any]:
         "host_disk_critical_pct": float(os.getenv("CTO_HOST_DISK_CRITICAL_PCT", "95")),
         "host_swap_warn_pct": float(os.getenv("CTO_HOST_SWAP_WARN_PCT", "35")),
         "scheduled_pm2_names": parse_csv_lower(os.getenv("CTO_SCHEDULED_PM2_NAMES", "labbit-cto-digest")),
+        "alert_notify_url": os.getenv("CTO_ALERT_NOTIFY_URL", "").strip(),
+        "alert_notify_token": os.getenv("CTO_ALERT_NOTIFY_TOKEN", "").strip(),
+        "alert_template_name": os.getenv("CTO_ALERT_TEMPLATE_NAME", "ops_status_alert").strip(),
+        "alert_language_code": os.getenv("CTO_ALERT_LANGUAGE_CODE", "en").strip(),
+        "alert_lab_id": os.getenv("CTO_ALERT_LAB_ID", "").strip(),
+        "host_label": os.getenv("CTO_HOST_LABEL", "").strip() or os.getenv("CTO_NODE_SUFFIX", "vps").upper() + " host",
         "scheduled_job_warn_age_seconds": int(os.getenv("CTO_SCHEDULED_JOB_WARN_AGE_SECONDS", str(30 * 60 * 60))),
         "scheduled_job_max_age_seconds": int(os.getenv("CTO_SCHEDULED_JOB_MAX_AGE_SECONDS", str(36 * 60 * 60))),
         "report_sender_config_path": os.getenv("CTO_REPORT_SENDER_CONFIG_PATH", "/opt/py_utils/workers/report_sender/config/report_sender.json"),
